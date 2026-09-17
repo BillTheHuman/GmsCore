@@ -13,6 +13,7 @@ jobs:
       GRADLE_MICROG_VERSION_WITHOUT_GIT: 1
 
     strategy:
+      fail-fast: false
       matrix:
         target: [Debug, Release]
 
@@ -62,3 +63,15 @@ jobs:
         run: "./gradlew assemble${{ matrix.target }}"
       - name: "Execute Gradle lint"
         run: "./gradlew lint${{ matrix.target }}"
+
+      - name: "Retain lint and build evidence"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-reports-${{ matrix.target }}
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            **/build/reports/lint-results-*.html
+            **/build/reports/lint-results-*.xml
+            **/build/intermediates/lint_intermediate_text_report/**/lint-results-*.txt
