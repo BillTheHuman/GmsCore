@@ -34,53 +34,21 @@ class EapAkaService(private val telephonyManager: TelephonyManager) {
     }
 
     @RequiresApi(Build.VERSION_CODES.N)
-    fun performSimAkaAuth(eapRelayBase64: String, imsi: String, mccMnc: String): String? {
-        val eapPacket = Base64.decode(eapRelayBase64, Base64.DEFAULT)
-        if (eapPacket.size < 12) return null
-
-        val code = eapPacket[0].toInt()
-        val eapId = eapPacket[1]
-        val type = eapPacket[4].toInt()
-        val subtype = eapPacket[5].toInt()
-
-        if (code != EAP_CODE_REQUEST || type != EAP_TYPE_AKA || subtype != EAP_AKA_SUBTYPE_CHALLENGE) {
-            Log.w(TAG, "Unexpected EAP packet: code=$code, type=$type, subtype=$subtype")
+    fun performSimAkaAuth(
+        eapRelayBase64: String,
+        imsi: String,
+        mccMnc: String,
+        eapIdentity: String? = null
+    ): String? {
+        val rawPacket = try {
+            Base64.decode(eapRelayBase64, Base64.DEFAULT)
+        } catch (_: IllegalArgumentException) {
             return null
         }
-
-        // Parse attributes (starting at offset 8)
-        var rand: ByteArray? = null
-        var autn: ByteArray? = null
-
-        var offset = 8
-        while (offset + 2 <= eapPacket.size) {
-            val attrType = eapPacket[offset].toInt() and 0xFF
-            val attrLen = (eapPacket[offset + 1].toInt() and 0xFF) * 4
-            if (offset + attrLen > eapPacket.size || attrLen < 4) break
-
-            when (attrType) {
-                AT_RAND -> {
-                    if (attrLen >= 20) {
-                        rand = ByteArray(16)
-                        System.arraycopy(eapPacket, offset + 4, rand, 0, 16)
-                    }
-                }
-
-                AT_AUTN -> {
-                    if (attrLen >= 20) {
-                        autn = ByteArray(16)
-                        System.arraycopy(eapPacket, offset + 4, autn, 0, 16)
-                    }
-                }
-            }
-            offset += attrLen
-            if (rand != null && autn != null) break
-        }
-
-        if (rand == null || autn == null) {
-            Log.e(TAG, "Missing RAND or AUTN in EAP-AKA challenge")
-            return null
-        }
+        val challenge = EapAkaChallenge.parse(rawPacket) ?: return null
+        val eapId = challenge.id
+        val rand = challenge.rand
+        val autn = challenge.autn
 
         val challengeBytes = byteArrayOf(16) + rand + byteArrayOf(16) + autn
         val challengeB64 = Base64.encodeToString(challengeBytes, Base64.NO_WRAP)
@@ -92,7 +60,11 @@ class EapAkaService(private val telephonyManager: TelephonyManager) {
             return null
         }
 
-        val iccBytes = Base64.decode(iccAuthResult, Base64.DEFAULT)
+        val iccBytes = try {
+            Base64.decode(iccAuthResult, Base64.DEFAULT)
+        } catch (_: IllegalArgumentException) {
+            return null
+        }
         if (iccBytes.isEmpty()) return null
 
         return when (iccBytes[0]) {
@@ -101,7 +73,10 @@ class EapAkaService(private val telephonyManager: TelephonyManager) {
                 val ck = extractTlv(1 + res.size + 1, iccBytes) ?: return null
                 val ik = extractTlv(1 + res.size + 1 + ck.size + 1, iccBytes) ?: return null
 
-                val identity = buildEapId(mccMnc, imsi)
+                if (res.size !in 4..16 || ck.size != 16 || ik.size != 16) return null
+                // Key derivation must use the identity actually sent to this server.
+                val identity = eapIdentity ?: buildEapId(mccMnc, imsi)
+                if (identity.isEmpty()) return null
                 val identityBytes = identity.toByteArray(StandardCharsets.UTF_8)
                 val keys = Fips186Prf.deriveKeys(identityBytes, ik, ck)
 
@@ -110,12 +85,19 @@ class EapAkaService(private val telephonyManager: TelephonyManager) {
                     return null
                 }
 
+                // AUTN authenticates the SIM vector, not the complete EAP request.
+                // Verify its AT_MAC before sending the successful challenge response.
+                if (!challenge.hasValidMac(kAut)) {
+                    Log.e(TAG, "Invalid EAP-AKA challenge MAC")
+                    return null
+                }
                 val responsePacket = buildEapAkaResponse(eapId, res, kAut) ?: return null
                 Base64.encodeToString(responsePacket, Base64.NO_WRAP)
             }
 
             SIM_RES_SYNC_FAIL -> {
                 val auts = extractTlv(1, iccBytes) ?: return null
+                if (auts.size != 14) return null
                 val responsePacket = buildEapAkaSyncFailure(eapId, auts)
                 Base64.encodeToString(responsePacket, Base64.NO_WRAP)
             }
